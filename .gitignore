@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv/
+out.txt
+test_out.txt
+.idea/
+.vscode/
+.DS_Store
+.gemini/
