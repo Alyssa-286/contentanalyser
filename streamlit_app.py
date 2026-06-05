@@ -10,6 +10,8 @@ from collections import Counter
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+from utils.avatar_template import build_avatar_html
 
 # Configure the API endpoint
 API_URL = "http://localhost:5000"
@@ -446,6 +448,22 @@ ratio_choice = st.sidebar.slider(
 )
 st.session_state.ratio = ratio_choice
 
+# AI Voice Assistant configuration toggle
+st.sidebar.markdown("<hr style='border: none; border-top: 1px solid rgba(226, 232, 240, 0.8); margin: 1.25rem 0;'/>", unsafe_allow_html=True)
+st.sidebar.markdown(
+    """
+    <div style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
+        <h3 style="font-weight: 800; font-size: 1.2rem; color: #1E293B; margin-bottom: 0.25rem; letter-spacing: -0.3px;">AI Voice Assistant</h3>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+avatar_enabled = st.sidebar.checkbox(
+    "Enable AI Avatar Reader 🤖",
+    value=False,
+    help="Enable an animated talking avatar to read out the summary with synchronized mouth movement."
+)
+
 st.sidebar.markdown("<div style='margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
 
 # Action Trigger Button
@@ -653,6 +671,11 @@ if st.session_state.summary_result:
             st.markdown("</div>", unsafe_allow_html=True)
 
     with col_out_right:
+        if avatar_enabled:
+            # Render avatar HTML component
+            avatar_html = build_avatar_html(summary_text)
+            components.html(avatar_html, height=560, scrolling=False)
+
         # Card 3: Metrics
         st.markdown(
             """
