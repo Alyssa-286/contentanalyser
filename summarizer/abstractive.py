@@ -6,8 +6,6 @@ batch inference, and progress tracking.
 
 import time
 from typing import List, Optional
-import torch
-from transformers import BartTokenizer, BartForConditionalGeneration
 from tqdm import tqdm
 
 from config import MODEL_NAME
@@ -20,9 +18,10 @@ class AbstractiveSummarizer:
     """
 
     # Class-level caches
-    _model: Optional[BartForConditionalGeneration] = None
-    _tokenizer: Optional[BartTokenizer] = None
+    _model: Optional[object] = None
+    _tokenizer: Optional[object] = None
     _device_str: Optional[str] = None
+    _available: bool = True
 
     def __init__(self, device: str = "auto") -> None:
         """
@@ -34,31 +33,37 @@ class AbstractiveSummarizer:
                           Defaults to 'auto'.
         """
         if AbstractiveSummarizer._model is None or AbstractiveSummarizer._tokenizer is None:
-            # Auto-detect device
-            if device == "auto":
-                if torch.cuda.is_available():
-                    detected_device = "cuda"
-                elif torch.backends.mps.is_available():
-                    detected_device = "mps"
+            try:
+                import torch
+                from transformers import BartForConditionalGeneration, BartTokenizer
+
+                # Auto-detect device
+                if device == "auto":
+                    if torch.cuda.is_available():
+                        detected_device = "cuda"
+                    elif torch.backends.mps.is_available():
+                        detected_device = "mps"
+                    else:
+                        detected_device = "cpu"
                 else:
-                    detected_device = "cpu"
-            else:
-                detected_device = device
+                    detected_device = device
 
-            print(f"Loading AbstractiveSummarizer model onto device: {detected_device}...")
-            
-            # Load tokenizer and model
-            tokenizer = BartTokenizer.from_pretrained(MODEL_NAME)
-            model = BartForConditionalGeneration.from_pretrained(MODEL_NAME)
-            
-            # Move model to target device
-            device_obj = torch.device(detected_device)
-            model = model.to(device_obj)
+                print(f"Loading AbstractiveSummarizer model onto device: {detected_device}...")
 
-            # Save to class-level cache
-            AbstractiveSummarizer._tokenizer = tokenizer
-            AbstractiveSummarizer._model = model
-            AbstractiveSummarizer._device_str = detected_device
+                tokenizer = BartTokenizer.from_pretrained(MODEL_NAME)
+                model = BartForConditionalGeneration.from_pretrained(MODEL_NAME)
+                device_obj = torch.device(detected_device)
+                model = model.to(device_obj)
+
+                AbstractiveSummarizer._tokenizer = tokenizer
+                AbstractiveSummarizer._model = model
+                AbstractiveSummarizer._device_str = detected_device
+            except Exception as exc:
+                print(f"Abstractive model unavailable, using fallback summarizer: {exc}")
+                AbstractiveSummarizer._available = False
+                AbstractiveSummarizer._tokenizer = None
+                AbstractiveSummarizer._model = None
+                AbstractiveSummarizer._device_str = "fallback"
         else:
             print(f"Using cached AbstractiveSummarizer on device: {AbstractiveSummarizer._device_str}")
 
@@ -70,6 +75,12 @@ class AbstractiveSummarizer:
         """
         Summarize a single text chunk that is guaranteed to be under the token limit.
         """
+        if not self._available or not self.tokenizer or not self.model:
+            words = text.split()
+            if len(words) <= 40:
+                return text.strip()
+            return " ".join(words[:max(40, min(len(words), max_length))]).strip()
+
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
@@ -85,7 +96,13 @@ class AbstractiveSummarizer:
 
         return self.tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
-    def summarize(self, text: str, max_length: int = 150, min_length: int = 40) -> str:
+    def summarize(
+        self,
+        text: str,
+        max_length: int = 150,
+        min_length: int = 40,
+        preferred_output: str = "High Quality",
+    ) -> str:
         """
         Generate an abstractive summary of the text. Supports long texts by
         chunking with overlap and utilizing map-reduce. Falls back to extractive
@@ -101,6 +118,34 @@ class AbstractiveSummarizer:
         """
         if not text or not text.strip():
             return ""
+
+        if not self._available or not self.tokenizer or not self.model:
+            from summarizer.preprocessor import TextPreprocessor
+            from utils.text_cleaner import clean_sentence, is_noise_sentence
+
+            preprocessor = TextPreprocessor()
+            sentences = preprocessor.tokenize_sentences(text)
+            cleaned = [clean_sentence(sentence) for sentence in sentences if not is_noise_sentence(sentence)]
+            if not cleaned:
+                return text[:500]
+
+            if preferred_output == "Fast Summary":
+                chosen = cleaned[:1]
+            else:
+                chosen = cleaned[:4]
+
+            fused = []
+            seen = set()
+            for sentence in chosen:
+                normalized = sentence.rstrip(". ")
+                if normalized and normalized not in seen:
+                    fused.append(normalized)
+                    seen.add(normalized)
+
+            if preferred_output == "Fast Summary":
+                return ". ".join(fused[:2]).strip() + ("." if fused else "")
+
+            return ". ".join(fused).strip() + ("." if fused else "")
 
         try:
             # Tokenize and get count
@@ -134,7 +179,12 @@ class AbstractiveSummarizer:
 
                 # Reduce step: concatenate and summarize again
                 concatenated_text = " ".join(chunk_summaries)
-                return self.summarize(concatenated_text, max_length=max_length, min_length=min_length)
+                return self.summarize(
+                    concatenated_text,
+                    max_length=max_length,
+                    min_length=min_length,
+                    preferred_output=preferred_output,
+                )
             else:
                 return self._summarize_single_chunk(text, max_length=max_length, min_length=min_length)
 
@@ -143,8 +193,10 @@ class AbstractiveSummarizer:
             try:
                 from summarizer.extractive import ExtractiveSummarizer
                 ext_summarizer = ExtractiveSummarizer()
-                # Use standard ratio of 0.3 as a sensible fallback
-                return ext_summarizer.summarize(text, ratio=0.3)
+                # Pick a fallback extractive ratio based on preferred_output so
+                # 'Fast Summary' yields a shorter result and 'High Quality' yields a fuller one.
+                fallback_ratio = 0.12 if preferred_output == "Fast Summary" else 0.35
+                return ext_summarizer.summarize(text, ratio=fallback_ratio)
             except Exception as ext_err:
                 print(f"Extractive fallback failed: {ext_err}")
                 return text[:500]  # Ultimate fallback to slicing text

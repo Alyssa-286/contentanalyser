@@ -19,6 +19,7 @@ preprocessor = None
 extractive_summarizer = None
 abstractive_summarizer = None
 keyword_extractor = None
+topic_modeler = None
 models_loaded = False
 
 app = Flask(__name__)
@@ -31,18 +32,20 @@ def load_models() -> None:
     """
     Load all models and preprocessors in memory at startup.
     """
-    global preprocessor, extractive_summarizer, abstractive_summarizer, keyword_extractor, models_loaded
+    global preprocessor, extractive_summarizer, abstractive_summarizer, keyword_extractor, topic_modeler, models_loaded
     if not models_loaded:
         print("--- Loading all models at startup ---")
         from summarizer.preprocessor import TextPreprocessor
         from summarizer.extractive import ExtractiveSummarizer
         from summarizer.abstractive import AbstractiveSummarizer
         from summarizer.keywords import KeywordExtractor
+        from summarizer.topics import TopicModeler
 
         preprocessor = TextPreprocessor()
         extractive_summarizer = ExtractiveSummarizer(preprocessor=preprocessor)
         abstractive_summarizer = AbstractiveSummarizer()
         keyword_extractor = KeywordExtractor()
+        topic_modeler = TopicModeler()
         models_loaded = True
         print("--- All models loaded successfully ---")
 
@@ -126,12 +129,14 @@ def health() -> Tuple[Response, int]:
 def _process_summarization_pipeline(
     text: str,
     mode: str,
-    ratio: float
+    ratio: float,
+    reference_summary: Optional[str] = None,
+    preferred_output: str = "High Quality",
 ) -> Tuple[Response, int]:
     """
     Helper function to run the cleaning, summarization, entity extraction, and keyword pipeline.
     """
-    global preprocessor, extractive_summarizer, abstractive_summarizer, keyword_extractor
+    global preprocessor, extractive_summarizer, abstractive_summarizer, keyword_extractor, topic_modeler
 
     # 0. Check for URL input and resolve
     text_strip = text.strip()
@@ -167,11 +172,21 @@ def _process_summarization_pipeline(
 
     # 2. Summarize
     summary = ""
+    extractive_payload = None
     try:
+        # Log the requested mode and preference for debugging
+        print(f"[DEBUG] Summarization requested - mode={mode}, preferred_output={preferred_output}")
         if mode == "abstractive":
-            summary = abstractive_summarizer.summarize(cleaned_text)
+            summary = abstractive_summarizer.summarize(cleaned_text, preferred_output=preferred_output)
         else:
-            summary = extractive_summarizer.summarize(cleaned_text, ratio=ratio)
+            effective_ratio = ratio
+            if preferred_output == "Fast Summary":
+                effective_ratio = max(0.1, min(ratio, 0.2))
+            else:
+                effective_ratio = max(ratio, 0.25)
+
+            extractive_payload = extractive_summarizer.summarize_with_sources(cleaned_text, ratio=effective_ratio)
+            summary = extractive_payload.get("summary", "")
     except Exception as e:
         return jsonify({"error": f"Summarization process failed: {str(e)}"}), 500
 
@@ -193,7 +208,15 @@ def _process_summarization_pipeline(
         except Exception:
             pass
 
-    # 5. Calculate Compression Ratio
+    # 5. Extract broad topics
+    topics = []
+    if topic_modeler:
+        try:
+            topics = topic_modeler.extract_topics(cleaned_text, n_topics=3, top_words=5)
+        except Exception:
+            pass
+
+    # 6. Calculate Compression Ratio
     summary_word_count = len(summary.split())
     if original_word_count > 0:
         reduction = max(0, int(round((1 - (summary_word_count / original_word_count)) * 100)))
@@ -201,13 +224,32 @@ def _process_summarization_pipeline(
         reduction = 0
     compression_str = f"{reduction}% reduction"
 
-    return jsonify({
+    rouge_scores = {}
+    if reference_summary and reference_summary.strip():
+        try:
+            from evaluation.rouge_eval import compute_rouge_scores
+
+            rouge_scores = compute_rouge_scores(reference_summary, summary)
+        except Exception:
+            rouge_scores = {}
+
+    response_payload = {
         "summary": summary,
         "keywords": keywords,
         "entities": entities,
+        "topics": topics,
+        "reference_summary": reference_summary or "",
         "word_count": original_word_count,
-        "compression": compression_str
-    }), 200
+        "compression": compression_str,
+    }
+
+    if mode == "extractive" and extractive_payload is not None:
+        response_payload["source_sentences"] = extractive_payload.get("source_sentences", [])
+
+    if rouge_scores:
+        response_payload["rouge"] = rouge_scores
+
+    return jsonify(response_payload), 200
 
 
 @app.route("/summarize", methods=["POST"])
@@ -235,7 +277,16 @@ def summarize() -> Tuple[Response, int]:
     if not (0.1 <= ratio <= 0.5):
         return jsonify({"error": "Ratio must be between 0.1 and 0.5."}), 400
 
-    return _process_summarization_pipeline(text, mode, ratio)
+    reference_summary = data.get("reference_summary", "")
+    preferred_output = data.get("preferred_output", "High Quality")
+
+    return _process_summarization_pipeline(
+        text,
+        mode,
+        ratio,
+        reference_summary=reference_summary,
+        preferred_output=preferred_output,
+    )
 
 
 @app.route("/upload", methods=["POST"])
@@ -263,6 +314,9 @@ def upload() -> Tuple[Response, int]:
     if not (0.1 <= ratio <= 0.5):
         return jsonify({"error": "Ratio must be between 0.1 and 0.5."}), 400
 
+    reference_summary = request.form.get("reference_summary", "")
+    preferred_output = request.form.get("preferred_output", "High Quality")
+
     suffix = os.path.splitext(uploaded_file.filename)[1].lower()
     if suffix not in (".txt", ".pdf"):
         return jsonify({"error": "Unsupported file format. Only .txt and .pdf are supported."}), 400
@@ -284,7 +338,13 @@ def upload() -> Tuple[Response, int]:
     if not extracted_text or not extracted_text.strip():
         return jsonify({"error": "Failed to extract text from file."}), 400
 
-    return _process_summarization_pipeline(extracted_text, mode, ratio)
+    return _process_summarization_pipeline(
+        extracted_text,
+        mode,
+        ratio,
+        reference_summary=reference_summary,
+        preferred_output=preferred_output,
+    )
 
 
 if __name__ == "__main__":

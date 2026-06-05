@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "title": "AI in Education Policy",
+    "source_type": "article",
+    "text": "Artificial intelligence is changing classroom instruction by helping teachers personalize lessons, automate feedback, and analyze student performance. Schools are adopting AI tools for tutoring, grading, and content recommendation. However, educators also warn that these systems must be transparent, bias-aware, and used with human oversight.",
+    "reference_summary": "AI is being used in education to personalize learning and automate tasks, but it must be applied carefully with transparency and human oversight."
+  },
+  {
+    "id": 2,
+    "title": "Climate Report Overview",
+    "source_type": "report",
+    "text": "The climate report highlights rising global temperatures, more frequent heat waves, and increased flooding in coastal regions. It recommends cutting emissions, investing in renewable energy, and improving resilience planning for vulnerable communities. The report also stresses the need for coordinated international policy and long-term adaptation strategies.",
+    "reference_summary": "The report warns of worsening climate impacts and recommends emission cuts, renewable energy, and adaptation planning."
+  },
+  {
+    "id": 3,
+    "title": "Startup Growth Story",
+    "source_type": "blog",
+    "text": "A small startup launched a summarization tool for students and researchers. After testing with long documents and web pages, the team improved parsing, cleanup, and output readability. The product now supports files, URLs, and video transcripts, which makes it useful for different study workflows.",
+    "reference_summary": "The startup improved its summarization tool by expanding input support and refining parsing and readability."
+  },
+  {
+    "id": 4,
+    "title": "PDF Research Abstract",
+    "source_type": "pdf",
+    "text": "This study investigates extractive and abstractive summarization for long-form content. The authors compare classical TextRank methods with transformer-based models and evaluate summary quality using ROUGE scores. Results show that transformer models produce more fluent summaries, while extractive methods remain faster and easier to interpret.",
+    "reference_summary": "The study compares TextRank and transformer summarization, finding that transformers are more fluent while extractive methods are faster and easier to interpret."
+  },
+  {
+    "id": 5,
+    "title": "YouTube Lecture Transcript",
+    "source_type": "youtube",
+    "text": "In this lecture, the instructor explains how summarization systems break documents into sentences, score them for importance, and generate a final response. The lecture also discusses named entity recognition, keyword extraction, and the tradeoff between speed and quality when using large language models.",
+    "reference_summary": "The lecture explains how summarization systems rank sentences, extract entities, and balance speed against quality."
+  }
+]

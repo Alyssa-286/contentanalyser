@@ -4,9 +4,11 @@ and summarize them using the system's summarizer modules.
 """
 
 import re
+from functools import lru_cache
 from typing import List, Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup
+import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
 
 
@@ -31,114 +33,8 @@ class YouTubeParser:
         Raises:
             ValueError: With a clean, user-friendly message if no transcript is available.
         """
-        # Import specific exceptions for targeted error handling
-        try:
-            from youtube_transcript_api._errors import (
-                TranscriptsDisabled,
-                NoTranscriptFound,
-                VideoUnavailable,
-            )
-        except ImportError:
-            TranscriptsDisabled = NoTranscriptFound = VideoUnavailable = Exception
-
         video_id = self._extract_video_id(url)
-        api = YouTubeTranscriptApi()
-        fetched = None
-
-        # ── Strategy 1: Direct fetch — English manual or auto-generated ──────────
-        for langs in (["en"], ["en-US", "en-GB", "en-CA", "en-AU"]):
-            try:
-                fetched = api.fetch(video_id, languages=langs)
-                break
-            except Exception:
-                continue
-
-        # ── Strategy 2: List all transcripts, pick the best available ────────────
-        if fetched is None:
-            try:
-                transcript_list = api.list(video_id)
-                transcripts = list(transcript_list)
-
-                if not transcripts:
-                    raise ValueError(
-                        f"No transcripts of any kind are available for this video (ID: {video_id}). "
-                        "The video creator has disabled subtitles. "
-                        "Please copy-paste the video content manually in the 'Paste Text' tab."
-                    )
-
-                # Prefer: manual > auto-generated, English > other language
-                def transcript_score(t) -> int:
-                    score = 0
-                    if not getattr(t, "is_generated", True):
-                        score += 10   # manual transcripts are higher quality
-                    lang = getattr(t, "language_code", "")
-                    if lang.startswith("en"):
-                        score += 5
-                    return score
-
-                best = sorted(transcripts, key=transcript_score, reverse=True)[0]
-
-                # If non-English, try to translate to English first
-                lang_code = getattr(best, "language_code", "")
-                if not lang_code.startswith("en"):
-                    try:
-                        best = best.translate("en")
-                    except Exception:
-                        pass  # Fall back to original language if translation fails
-
-                fetched = best.fetch()
-
-            except ValueError:
-                raise  # Re-raise our clean messages
-            except TranscriptsDisabled:
-                raise ValueError(
-                    f"Subtitles are disabled for this video (ID: {video_id}). "
-                    "The video creator has turned off captions. "
-                    "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
-                )
-            except VideoUnavailable:
-                raise ValueError(
-                    f"The YouTube video '{video_id}' is unavailable (private, deleted, or region-restricted). "
-                    "Please check the URL and try again."
-                )
-            except NoTranscriptFound:
-                raise ValueError(
-                    f"No English transcript found for video '{video_id}', "
-                    "and no other transcript could be retrieved. "
-                    "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
-                )
-            except StopIteration:
-                raise ValueError(
-                    f"No transcripts of any kind are available for this video (ID: {video_id}). "
-                    "The video creator has disabled subtitles. "
-                    "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
-                )
-            except Exception as e:
-                error_msg = str(e)
-                # Detect the "subtitles disabled" message from the API
-                if "subtitles are disabled" in error_msg.lower() or "no transcript" in error_msg.lower():
-                    raise ValueError(
-                        f"No transcript available for video '{video_id}' — subtitles appear to be disabled. "
-                        "👉 Try the 'Paste Text' tab and paste the video content manually."
-                    )
-                raise ValueError(
-                    f"Could not retrieve transcript for video '{video_id}'. "
-                    f"YouTube may be rate-limiting requests. "
-                    f"👉 Try again in a few minutes, or use the 'Paste Text' tab."
-                )
-
-        # ── Concatenate & clean transcript ────────────────────────────────────────
-        snippets = list(fetched)
-        full_text = " ".join([s.text for s in snippets if s.text])
-        full_text = re.sub(r"\s+", " ", full_text).strip()
-
-        if not full_text:
-            raise ValueError(
-                f"The transcript for video '{video_id}' was retrieved but is empty. "
-                "The video may be audio-only or the captions may not contain any text."
-            )
-
-        return full_text
+        return _get_transcript_cached(video_id)
 
     def chunk_transcript(self, transcript: str, chunk_size: int = 3000) -> List[str]:
         """
@@ -345,6 +241,113 @@ class YouTubeParser:
         except Exception:
             pass
         return f"YouTube Video ({video_id})"
+
+
+@lru_cache(maxsize=128)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_transcript_cached(video_id: str) -> str:
+    """Fetch and cache a YouTube transcript for one hour."""
+    try:
+        from youtube_transcript_api._errors import (
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+        )
+    except ImportError:
+        NoTranscriptFound = TranscriptsDisabled = VideoUnavailable = Exception
+
+    api = YouTubeTranscriptApi()
+    fetched = None
+
+    # Strategy 1: direct fetch in common English variants.
+    for langs in (["en"], ["en-US", "en-GB", "en-CA", "en-AU"]):
+        try:
+            fetched = api.fetch(video_id, languages=langs)
+            break
+        except Exception:
+            continue
+
+    # Strategy 2: inspect available transcripts and choose the best one.
+    if fetched is None:
+        try:
+            transcript_list = api.list(video_id)
+            transcripts = list(transcript_list)
+
+            if not transcripts:
+                raise ValueError(
+                    f"No transcripts of any kind are available for this video (ID: {video_id}). "
+                    "The video creator has disabled subtitles. "
+                    "Please copy-paste the video content manually in the 'Paste Text' tab."
+                )
+
+            def transcript_score(t) -> int:
+                score = 0
+                if not getattr(t, "is_generated", True):
+                    score += 10
+                lang = getattr(t, "language_code", "")
+                if lang.startswith("en"):
+                    score += 5
+                return score
+
+            best = sorted(transcripts, key=transcript_score, reverse=True)[0]
+
+            lang_code = getattr(best, "language_code", "")
+            if not lang_code.startswith("en"):
+                try:
+                    best = best.translate("en")
+                except Exception:
+                    pass
+
+            fetched = best.fetch()
+        except ValueError:
+            raise
+        except TranscriptsDisabled:
+            raise ValueError(
+                f"Subtitles are disabled for this video (ID: {video_id}). "
+                "The video creator has turned off captions. "
+                "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
+            )
+        except VideoUnavailable:
+            raise ValueError(
+                f"The YouTube video '{video_id}' is unavailable (private, deleted, or region-restricted). "
+                "Please check the URL and try again."
+            )
+        except NoTranscriptFound:
+            raise ValueError(
+                f"No English transcript found for video '{video_id}', "
+                "and no other transcript could be retrieved. "
+                "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
+            )
+        except StopIteration:
+            raise ValueError(
+                f"No transcripts of any kind are available for this video (ID: {video_id}). "
+                "The video creator has disabled subtitles. "
+                "👉 Try the 'Paste Text' tab and paste the transcript or key content manually."
+            )
+        except Exception as exc:
+            error_msg = str(exc).lower()
+            if "subtitles are disabled" in error_msg or "no transcript" in error_msg:
+                raise ValueError(
+                    f"No transcript available for video '{video_id}' — subtitles appear to be disabled. "
+                    "👉 Try the 'Paste Text' tab and paste the video content manually."
+                )
+            raise ValueError(
+                f"Could not retrieve transcript for video '{video_id}'. "
+                "YouTube may be rate-limiting requests right now. "
+                "Please try again in a few minutes or paste the content manually in the 'Paste Text' tab."
+            )
+
+    snippets = list(fetched)
+    full_text = " ".join([s.text for s in snippets if s.text])
+    full_text = re.sub(r"\s+", " ", full_text).strip()
+
+    if not full_text:
+        raise ValueError(
+            f"The transcript for video '{video_id}' was retrieved but is empty. "
+            "The video may be audio-only or the captions may not contain any text."
+        )
+
+    return full_text
 
 
 if __name__ == "__main__":

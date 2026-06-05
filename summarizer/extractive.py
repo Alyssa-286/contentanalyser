@@ -10,7 +10,7 @@ Key improvements over naive TextRank:
 """
 
 from summarizer.preprocessor import TextPreprocessor
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Tuple
 import re
 import numpy as np
 import networkx as nx
@@ -46,7 +46,7 @@ class ExtractiveSummarizer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _clean_and_filter(self, sentences: List[str]) -> tuple[List[str], List[int]]:
+    def _clean_and_filter(self, sentences: List[str]) -> Tuple[List[str], List[int]]:
         """
         Clean each sentence and remove noise. Returns:
           - cleaned sentences list
@@ -123,6 +123,56 @@ class ExtractiveSummarizer:
         # Return in original document order
         return sorted(selected)
 
+    def _summarize_core(self, text: str, ratio: float = 0.3) -> Dict[str, Any]:
+        """Run the extractive pipeline and return summary text plus source sentences."""
+        if not text or not text.strip():
+            return {"summary": "", "source_sentences": []}
+
+        raw_sentences = self.preprocessor.tokenize_sentences(text)
+        if len(raw_sentences) < 3:
+            simple_sentences = [clean_sentence(s) for s in raw_sentences if not is_noise_sentence(s)]
+            return {
+                "summary": "\n\n".join(simple_sentences),
+                "source_sentences": [
+                    {"rank": index + 1, "source_index": index, "sentence": sentence}
+                    for index, sentence in enumerate(simple_sentences)
+                ],
+            }
+
+        ratio = max(0.1, min(0.5, ratio))
+
+        cleaned, index_map = self._clean_and_filter(raw_sentences)
+        if len(cleaned) < 3:
+            return {
+                "summary": "\n\n".join(cleaned),
+                "source_sentences": [
+                    {"rank": index + 1, "source_index": index_map[index], "sentence": sentence}
+                    for index, sentence in enumerate(cleaned)
+                ],
+            }
+
+        k = max(3, int(round(len(cleaned) * ratio)))
+        avg_words = sum(len(sentence.split()) for sentence in cleaned) / len(cleaned)
+        k = min(k, max(3, int(MAX_SUMMARY_WORDS / max(avg_words, 1))))
+
+        scores = self._get_sentence_scores(cleaned)
+        selected_indices = self._pick_sentences(cleaned, scores, k)
+
+        selected = [cleaned[index] for index in selected_indices]
+        source_sentences = [
+            {
+                "rank": position + 1,
+                "source_index": index_map[index],
+                "sentence": cleaned[index],
+            }
+            for position, index in enumerate(selected_indices)
+        ]
+
+        return {
+            "summary": self._format_output(selected),
+            "source_sentences": source_sentences,
+        }
+
     def _format_output(self, sentences: List[str]) -> str:
         """
         Group sentences into short paragraphs for readability.
@@ -151,40 +201,11 @@ class ExtractiveSummarizer:
         Returns:
             str: Multi-paragraph extractive summary, free of citation noise.
         """
-        if not text or not text.strip():
-            return ""
+        return self._summarize_core(text, ratio=ratio)["summary"]
 
-        # Tokenise original sentences
-        raw_sentences = self.preprocessor.tokenize_sentences(text)
-        n = len(raw_sentences)
-
-        if n < 3:
-            # Short text — clean and return as-is
-            return "\n\n".join(
-                clean_sentence(s) for s in raw_sentences if not is_noise_sentence(s)
-            )
-
-        ratio = max(0.1, min(0.5, ratio))
-
-        # Clean & filter noise sentences
-        cleaned, _ = self._clean_and_filter(raw_sentences)
-        nc = len(cleaned)
-
-        if nc < 3:
-            return "\n\n".join(cleaned)
-
-        # Number of sentences to target
-        k = max(3, int(round(nc * ratio)))
-        # Hard cap: never pick more sentences than fit in MAX_SUMMARY_WORDS
-        avg_words = sum(len(s.split()) for s in cleaned) / nc
-        k = min(k, max(3, int(MAX_SUMMARY_WORDS / max(avg_words, 1))))
-
-        # Score and select
-        scores = self._get_sentence_scores(cleaned)
-        selected_indices = self._pick_sentences(cleaned, scores, k)
-
-        selected = [cleaned[i] for i in selected_indices]
-        return self._format_output(selected)
+    def summarize_with_sources(self, text: str, ratio: float = 0.3) -> Dict[str, Any]:
+        """Return the summary and the source sentences used to build it."""
+        return self._summarize_core(text, ratio=ratio)
 
     def summarize_bullets(self, text: str, n: int = 5) -> List[str]:
         """

@@ -6,11 +6,9 @@ Uses spaCy and NLTK for text cleaning, tokenization, lemmatization, stopword rem
 import re
 import time
 from typing import List, Dict, Optional, Any, Set
-import spacy
-from spacy.language import Language
-from spacy.tokens import Doc
 import nltk
 from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
 
 # Ensure NLTK resources are available
 try:
@@ -26,7 +24,8 @@ class TextPreprocessor:
     """
 
     # Class-level cache for lazy loading the spaCy model
-    _nlp_cache: Optional[Language] = None
+    _nlp_cache: Optional[Any] = None
+    _spacy_available: bool = True
 
     # Custom domain-specific stopwords to be removed in addition to standard NLTK stopwords
     DEFAULT_CUSTOM_STOPWORDS: Set[str] = {
@@ -55,20 +54,30 @@ class TextPreprocessor:
             self.stopwords.update(word.lower() for word in custom_stopwords)
 
     @classmethod
-    def _get_nlp(cls) -> Language:
+    def _get_nlp(cls) -> Any:
         """
         Retrieve or load the spaCy model from the class cache.
 
         Returns:
             Language: The loaded spaCy Language model.
         """
-        if cls._nlp_cache is None:
+        if cls._nlp_cache is None and cls._spacy_available:
             try:
+                import spacy
+
                 cls._nlp_cache = spacy.load("en_core_web_sm")
             except OSError:
-                from spacy.cli import download
-                download("en_core_web_sm")
-                cls._nlp_cache = spacy.load("en_core_web_sm")
+                try:
+                    from spacy.cli import download
+
+                    download("en_core_web_sm")
+                    cls._nlp_cache = spacy.load("en_core_web_sm")
+                except Exception:
+                    cls._spacy_available = False
+                    cls._nlp_cache = None
+            except Exception:
+                cls._spacy_available = False
+                cls._nlp_cache = None
         return cls._nlp_cache
 
     def clean(self, text: Optional[str]) -> str:
@@ -114,6 +123,9 @@ class TextPreprocessor:
             return []
 
         nlp = self._get_nlp()
+        if not nlp:
+            return [sentence.strip() for sentence in re.split(r'(?<=[.!?])\s+', text) if sentence.strip()]
+
         # Disable unused components for maximum speed; parser requires tok2vec to function
         enable_pipes = []
         if "tok2vec" in nlp.pipe_names:
@@ -141,6 +153,9 @@ class TextPreprocessor:
             return []
 
         nlp = self._get_nlp()
+        if not nlp:
+            return [token.lower() for token in re.findall(r"[A-Za-z0-9']+", text)]
+
         doc = nlp.make_doc(text)
         return [
             token.text.lower()
@@ -177,6 +192,12 @@ class TextPreprocessor:
             return []
 
         nlp = self._get_nlp()
+        if not nlp:
+            stemmer = PorterStemmer()
+            return [stemmer.stem(token.lower()) for token in tokens]
+
+        from spacy.tokens import Doc
+
         doc = Doc(nlp.vocab, words=tokens)
 
         needed_pipes = {"tok2vec", "tagger", "attribute_ruler", "lemmatizer"}
@@ -214,6 +235,9 @@ class TextPreprocessor:
             return entities
 
         nlp = self._get_nlp()
+        if not nlp:
+            return entities
+
         # Enable only NER and its dependency components
         with nlp.select_pipes(enable=["ner", "tok2vec"]):
             doc = nlp(text)
@@ -255,6 +279,20 @@ class TextPreprocessor:
 
         # 2. Run single spaCy pass over the cleaned text
         nlp = self._get_nlp()
+        if not nlp:
+            sentences = [sentence.strip() for sentence in re.split(r'(?<=[.!?])\s+', cleaned) if sentence.strip()]
+            tokens = self.tokenize_words(cleaned)
+            tokens_no_stopwords = self.remove_stopwords(tokens)
+            lemmas = self.lemmatize(tokens)
+            return {
+                "cleaned_text": cleaned,
+                "sentences": sentences,
+                "tokens": tokens,
+                "tokens_no_stopwords": tokens_no_stopwords,
+                "lemmas": lemmas,
+                "entities": {"PERSON": [], "ORG": [], "DATE": [], "GPE": []},
+            }
+
         doc = nlp(cleaned)
 
         # 3. Extract sentences

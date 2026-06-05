@@ -6,15 +6,32 @@ Features a high-fidelity glassmorphic UI with animated floating background eleme
 
 import time
 import json
+import hashlib
+from pathlib import Path
 from collections import Counter
 import requests
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from utils.avatar_template import build_avatar_html
+from utils.avatar_media import build_avatar_html
+
+from evaluation.rouge_eval import compute_rouge_scores
+from utils.youtube_parser import YouTubeParser
 
 # Configure the API endpoint
 API_URL = "http://localhost:5000"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_youtube_transcript_cached(url: str) -> str:
+    """Fetch and cache YouTube transcripts to avoid rate limits."""
+    try:
+        parser = YouTubeParser()
+        return parser.get_transcript(url)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "rate" in error_msg or "too many requests" in error_msg or "429" in error_msg or "toomanyrequests" in error_msg:
+            return "ERROR: YouTube transcript service is currently rate-limited. Please try pasting raw text or using an alternative video link."
+        return f"ERROR: {str(e)}"
 
 # 1. Page Configuration
 st.set_page_config(
@@ -347,14 +364,82 @@ if "ratio" not in st.session_state:
     st.session_state.ratio = 0.2
 if "summary_result" not in st.session_state:
     st.session_state.summary_result = None
+if "comparison_result" not in st.session_state:
+    st.session_state.comparison_result = None
 if "last_error" not in st.session_state:
     st.session_state.last_error = None
+if "reference_summary" not in st.session_state:
+    st.session_state.reference_summary = ""
+if "summary_preference" not in st.session_state:
+    st.session_state.summary_preference = "High Quality"
 
 
 # Helper function to clear results
 def clear_results():
+    """Clear stored results and errors when the input context changes."""
     st.session_state.summary_result = None
+    st.session_state.comparison_result = None
     st.session_state.last_error = None
+
+
+def _hash_bytes(payload_bytes):
+    """Build a stable cache key fragment for uploaded file content."""
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def submit_summary_request(
+    cache_key,
+    input_mode,
+    payload_text,
+    uploaded_name,
+    uploaded_type,
+    uploaded_bytes,
+    mode_choice,
+    ratio_choice,
+    reference_summary,
+    preferred_output,
+):
+    """Submit one summarization request to the backend and cache repeated calls."""
+    session = requests.Session()
+    if input_mode == "Upload PDF/TXT":
+        files = {"file": (uploaded_name, uploaded_bytes, uploaded_type)}
+        data = {
+            "mode": mode_choice,
+            "ratio": ratio_choice,
+            "reference_summary": reference_summary,
+            "preferred_output": preferred_output,
+        }
+        response = session.post(
+            f"{API_URL}/upload",
+            files=files,
+            data=data,
+            timeout=90,
+        )
+    else:
+        payload = {
+            "text": payload_text.strip(),
+            "mode": mode_choice,
+            "ratio": ratio_choice,
+            "reference_summary": reference_summary,
+            "preferred_output": preferred_output,
+        }
+        response = session.post(
+            f"{API_URL}/summarize",
+            json=payload,
+            timeout=90,
+        )
+
+    if response.status_code == 200:
+        return response.json(), None
+
+    try:
+        error_json = response.json()
+        error_message = error_json.get("error", "An unknown error occurred on the server.")
+    except ValueError:
+        error_message = f"Server returned error code {response.status_code}: {response.text}"
+
+    return None, error_message
 
 
 # 4. Main Interface Header
@@ -427,11 +512,25 @@ elif input_mode == "Web URL":
 
 st.sidebar.markdown("<hr style='border: none; border-top: 1px solid rgba(226, 232, 240, 0.8); margin: 1.5rem 0;'/>", unsafe_allow_html=True)
 
+st.sidebar.text_area(
+    "Reference Summary (for ROUGE evaluation)",
+    placeholder="Paste a human-written reference summary here to score ROUGE-1 / ROUGE-2 / ROUGE-L.",
+    height=180,
+    key="reference_summary",
+)
+
+st.sidebar.radio(
+    "Preferred Output",
+    ["Fast Summary", "High Quality"],
+    index=1 if st.session_state.summary_preference == "High Quality" else 0,
+    key="summary_preference",
+)
+
 # Summarization Mode
 mode_choice = st.sidebar.radio(
     "Summarization Pipeline",
-    ["Extractive", "Abstractive"],
-    index=0 if st.session_state.mode == "Extractive" else 1,
+    ["Extractive", "Abstractive", "Comparison View"],
+    index=0 if st.session_state.mode == "Extractive" else (1 if st.session_state.mode == "Abstractive" else 2),
     key="mode_radio"
 )
 st.session_state.mode = mode_choice
@@ -468,10 +567,18 @@ st.sidebar.markdown("<div style='margin-bottom: 1rem;'></div>", unsafe_allow_htm
 
 # Action Trigger Button
 summarize_trigger = st.sidebar.button(
-    "Generate Summary",
+    "Generate Comparison",
     use_container_width=True,
     type="primary"
 )
+
+
+def _resolve_avatar_image_path() -> str:
+    # Directly point to the requested local asset
+    path = Path("e:/nlpproj/Content-analyser/1000230473.jpg")
+    if path.is_file():
+        return str(path)
+    return "1000230473.jpg"
 
 # 6. API Request Orchestrator
 if summarize_trigger:
@@ -490,63 +597,80 @@ if summarize_trigger:
         st.session_state.last_error = error_msg
         st.session_state.summary_result = None
     else:
-        st.session_state.last_error = None
-        session = get_http_session()
-        
-        with st.spinner("Processing document and generating summary..."):
-            try:
-                # Perform call depending on the input source
-                if input_mode == "Upload PDF/TXT":
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                    data = {
-                        "mode": mode_choice.lower(),
-                        "ratio": ratio_choice
-                    }
-                    response = session.post(
-                        f"{API_URL}/upload",
-                        files=files,
-                        data=data,
-                        timeout=90
-                    )
-                else:
-                    payload = {
-                        "text": payload_text.strip(),
-                        "mode": mode_choice.lower(),
-                        "ratio": ratio_choice
-                    }
-                    response = session.post(
-                        f"{API_URL}/summarize",
-                        json=payload,
-                        timeout=90
-                    )
-                
-                # Handle response
-                if response.status_code == 200:
-                    st.session_state.summary_result = response.json()
-                else:
-                    try:
-                        err_json = response.json()
-                        st.session_state.last_error = err_json.get("error", "An unknown error occurred on the server.")
-                    except ValueError:
-                        st.session_state.last_error = f"Server returned error code {response.status_code}: {response.text}"
+        # Pre-fetch YouTube transcripts using Streamlit's cache
+        if input_mode == "YouTube URL":
+            with st.spinner("Fetching YouTube transcript..."):
+                yt_res = fetch_youtube_transcript_cached(payload_text.strip())
+                if yt_res.startswith("ERROR:"):
+                    st.session_state.last_error = yt_res[6:].strip()
                     st.session_state.summary_result = None
+                    valid = False
+                else:
+                    payload_text = yt_res
 
-            except requests.exceptions.Timeout:
-                st.session_state.last_error = (
-                    "The request timed out (limit: 90s). This usually happens when "
-                    "processing very large documents or when downloading a large model. "
-                    "Please try a shorter text or check if the backend is responsive."
-                )
-                st.session_state.summary_result = None
-            except requests.exceptions.ConnectionError:
-                st.session_state.last_error = (
-                    "Unable to connect to the Flask API backend at http://localhost:5000. "
-                    "Make sure you have started the Flask server by running 'python app.py' in the background."
-                )
-                st.session_state.summary_result = None
-            except Exception as e:
-                st.session_state.last_error = f"Request failed: {str(e)}"
-                st.session_state.summary_result = None
+        if valid:
+            st.session_state.last_error = None
+            comparison_result = {}
+            comparison_errors = []
+            cache_prefix = "upload" if input_mode == "Upload PDF/TXT" else "text"
+            uploaded_bytes = uploaded_file.getvalue() if uploaded_file else b""
+            uploaded_hash = _hash_bytes(uploaded_bytes) if uploaded_bytes else ""
+            preferred_mode = "extractive" if st.session_state.summary_preference == "Fast Summary" else "abstractive"
+            
+            with st.spinner("Processing document and generating summary..."):
+                try:
+                    # Determine which modes to execute based on sidebar selection
+                    if mode_choice == "Comparison View":
+                        modes_to_run = ["extractive", "abstractive"]
+                    else:
+                        modes_to_run = [mode_choice.lower()]
+    
+                    for mode_key in modes_to_run:
+                        # include preferred output in cache key so Fast/High don't collide
+                        pref_key = st.session_state.summary_preference.replace(" ", "_")
+                        result, error = submit_summary_request(
+                            f"{cache_prefix}:{mode_key}:{ratio_choice}:{pref_key}:{payload_text.strip()}:{uploaded_hash}:{st.session_state.reference_summary.strip()}",
+                            input_mode,
+                            payload_text,
+                            uploaded_file.name if uploaded_file else "",
+                            uploaded_file.type if uploaded_file else "",
+                            uploaded_bytes,
+                            mode_key,
+                            ratio_choice,
+                            st.session_state.reference_summary.strip(),
+                            st.session_state.summary_preference,
+                        )
+                        if result is not None:
+                            comparison_result[mode_key] = result
+                        elif error:
+                            comparison_errors.append(f"{mode_key.title()}: {error}")
+    
+                    if comparison_result:
+                        st.session_state.comparison_result = comparison_result
+                        st.session_state.summary_result = comparison_result.get(preferred_mode)
+                        if comparison_errors:
+                            st.session_state.last_error = " | ".join(comparison_errors)
+                    else:
+                        st.session_state.comparison_result = None
+                        st.session_state.summary_result = None
+                        st.session_state.last_error = " | ".join(comparison_errors) if comparison_errors else "Request failed."
+    
+                except requests.exceptions.Timeout:
+                    st.session_state.last_error = (
+                        "The request timed out (limit: 90s). This usually happens when "
+                        "processing very large documents or when downloading a large model. "
+                        "Please try a shorter text or check if the backend is responsive."
+                    )
+                    st.session_state.summary_result = None
+                except requests.exceptions.ConnectionError:
+                    st.session_state.last_error = (
+                        "Unable to connect to the Flask API backend at http://localhost:5000. "
+                        "Make sure you have started the Flask server by running 'python app.py' in the background."
+                    )
+                    st.session_state.summary_result = None
+                except Exception as e:
+                    st.session_state.last_error = f"Request failed: {str(e)}"
+                    st.session_state.summary_result = None
 
 
 # 7. Main Dashboard Area Rendering
@@ -617,27 +741,102 @@ if st.session_state.last_error:
         st.error(raw_err)
 
 # Results Dashboard
-if st.session_state.summary_result:
-    res = st.session_state.summary_result
+if st.session_state.comparison_result:
+    extractive_res = st.session_state.comparison_result.get("extractive")
+    abstractive_res = st.session_state.comparison_result.get("abstractive")
+    primary_res = st.session_state.summary_result or extractive_res or abstractive_res
+    res = primary_res or {}
     summary_text = res.get("summary", "")
     
-    # Left / Right Split for Results & Statistics
+    # Left / Right Split for Summary Comparison and Statistics
     col_out_left, col_out_right = st.columns([7, 5], gap="large")
     
     with col_out_left:
-        # Card 1: Summary Output
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h3 style="font-weight: 800; font-size: 1.4rem; color: #1E293B; margin-bottom: 1.25rem; letter-spacing: -0.3px;">Summary Comparison</h3>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if mode_choice == "Comparison View":
+            compare_col_1, compare_col_2 = st.columns(2)
+            with compare_col_1:
+                st.markdown(
+                    "<div style='font-weight: 700; margin-bottom: 0.5rem;'>Extractive Summary</div>",
+                    unsafe_allow_html=True,
+                )
+                if extractive_res:
+                    st.info(extractive_res.get("summary", ""))
+                    source_sentences = extractive_res.get("source_sentences", [])
+                    if source_sentences:
+                        with st.expander("Show source sentences", expanded=False):
+                            for item in source_sentences:
+                                st.markdown(f"- **Sentence {item.get('rank')}**: {item.get('sentence', '')}")
+                else:
+                    st.warning("Extractive summary could not be generated.")
+            with compare_col_2:
+                st.markdown(
+                    "<div style='font-weight: 700; margin-bottom: 0.5rem;'>Abstractive Summary</div>",
+                    unsafe_allow_html=True,
+                )
+                if abstractive_res:
+                    st.info(abstractive_res.get("summary", ""))
+                else:
+                    st.warning("Abstractive summary could not be generated.")
+        elif mode_choice == "Extractive":
+            st.markdown(
+                "<div style='font-weight: 700; margin-bottom: 0.5rem;'>Extractive Summary</div>",
+                unsafe_allow_html=True,
+            )
+            if extractive_res:
+                st.info(extractive_res.get("summary", ""))
+                source_sentences = extractive_res.get("source_sentences", [])
+                if source_sentences:
+                    with st.expander("Show source sentences", expanded=False):
+                        for item in source_sentences:
+                            st.markdown(f"- **Sentence {item.get('rank')}**: {item.get('sentence', '')}")
+            else:
+                st.warning("Extractive summary could not be generated.")
+        elif mode_choice == "Abstractive":
+            st.markdown(
+                "<div style='font-weight: 700; margin-bottom: 0.5rem;'>Abstractive Summary</div>",
+                unsafe_allow_html=True,
+            )
+            if abstractive_res:
+                st.info(abstractive_res.get("summary", ""))
+            else:
+                st.warning("Abstractive summary could not be generated.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        topics = res.get("topics", [])
+        if topics:
+            st.markdown(
+                """
+                <div class="glass-card">
+                    <h3 style="font-weight: 800; font-size: 1.3rem; color: #1E293B; margin-bottom: 1.25rem; letter-spacing: -0.3px;">Top Topics</h3>
+                """,
+                unsafe_allow_html=True,
+            )
+            for topic in topics:
+                st.markdown(f"**{topic.get('topic', 'Topic')}**: {topic.get('label', '')}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Card 2: Primary Summary Download
         st.markdown(
             """
             <div class="glass-card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
-                    <h3 style="font-weight: 800; font-size: 1.4rem; color: #1E293B; margin: 0; letter-spacing: -0.3px;">Generated Summary</h3>
+                    <h3 style="font-weight: 800; font-size: 1.4rem; color: #1E293B; margin: 0; letter-spacing: -0.3px;">Selected Summary</h3>
                     <span style="background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%); color: white; font-size: 0.75rem; font-weight: 700; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Ready</span>
                 </div>
             """,
             unsafe_allow_html=True
         )
         
-        # Display the summary text beautifully inside st.info equivalent styled box
+        # Display the primary summary text in the selected mode
         st.info(summary_text)
         
         # Action button to download
@@ -652,7 +851,7 @@ if st.session_state.summary_result:
         
         st.markdown("</div>", unsafe_allow_html=True)
         
-        # Card 2: Keywords
+        # Card 3: Keywords
         keywords = res.get("keywords", [])
         if keywords:
             st.markdown(
@@ -673,10 +872,9 @@ if st.session_state.summary_result:
     with col_out_right:
         if avatar_enabled:
             # Render avatar HTML component
-            avatar_html = build_avatar_html(summary_text)
-            components.html(avatar_html, height=560, scrolling=False)
+            avatar_html = build_avatar_html(summary_text, image_path=_resolve_avatar_image_path() or None)
+            components.html(avatar_html, height=620, scrolling=False)
 
-        # Card 3: Metrics
         st.markdown(
             """
             <div class="glass-card">
@@ -708,10 +906,29 @@ if st.session_state.summary_result:
             value=compression_ratio,
             help="Ratio of words removed by the summarization pipeline."
         )
+
+        if st.session_state.reference_summary.strip():
+            reference_summary = st.session_state.reference_summary.strip()
+            rouge_scores = compute_rouge_scores(reference_summary, summary_text)
+            if rouge_scores:
+                st.markdown("<div style='margin-top: 1rem;'></div>", unsafe_allow_html=True)
+                st.markdown("**ROUGE vs reference summary**")
+                rouge_df = pd.DataFrame(
+                    [
+                        {
+                            "Metric": metric.upper(),
+                            "Precision": scores["precision"],
+                            "Recall": scores["recall"],
+                            "F1": scores["fmeasure"],
+                        }
+                        for metric, scores in rouge_scores.items()
+                    ]
+                )
+                st.dataframe(rouge_df, use_container_width=True, hide_index=True)
         
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Card 4: Entities Detected
+        # Card 5: Entities Detected
         st.markdown(
             """
             <div class="glass-card">
